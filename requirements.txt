@@ -1,0 +1,17 @@
+# 데이터베이스 및 ORM
+SQLAlchemy>=2.0.38
+psycopg2-binary>=2.9.10      # PostgreSQL 연결용
+
+# SFTP (SSH 연결)
+paramiko>=3.5.0
+
+# 설정 관리
+python-dotenv>=1.0.1
+pydantic-settings>=2.8.0     # 환경 변수 자동 검증
+orjson>=3.10.0               # 빠른 JSON 직렬화/역직렬화
+
+# 작업 자동화
+apscheduler>=3.11.0
+
+# 재시도 로직 (네트워크 장애 대비)
+tenacity>=9.0.0

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "sample_task",
+    "cron": "*/1 * * * *"
+  },
+  {
+    "name": "retry_task",
+    "cron": "*/1 * * * *",
+    "args": [
+      "user123",
+      "delete"
+    ]
+  },
+  {
+    "name": "hybrid_task",
+    "cron": "*/1 * * * *",
+    "args": [
+      "task_999"
+    ]
+  },
+  {
+    "name": "save_all_fields_to_jsonl",
+    "cron": "34 * * * *",
+    "args": []
+  }
+]

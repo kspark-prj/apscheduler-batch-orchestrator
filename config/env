@@ -1,0 +1,17 @@
+# ====== 크론 스케줄러 운영 인프라 설정 ======
+USE_DB=False
+USE_JSON_CONFIG=True
+USE_TXT_CONFIG=True
+
+# 데이터베이스 postgresql
+DATABASE_URL=postgresql+psycopg2://postgres:root@localhost:5432/my-app-db
+
+# SFTP
+SFTP_HOST=127.0.0.1
+SFTP_USER=tester
+SFTP_PASS=password
+SFTP_PORT=22
+SFTP_TIMEOUT=10
+
+# 외부 서브프로세스 실행 타임아웃 제한 (초 단위, 예: 3600 = 1시간)
+SUBPROCESS_TIMEOUT=60
