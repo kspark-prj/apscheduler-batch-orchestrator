@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 # 1. 다른 모듈을 임포트하기 전에 '가장 먼저' 환경 변수를 로드합니다.
@@ -56,6 +57,10 @@ def run_table_registration():
             )
             connection.execute(
                 insert_query, {"job_name": "export_and_upload", "last_processed_id": 0}
+            )
+            connection.execute(
+                insert_query,
+                {"job_name": "save_polars_all_fields_to_jsonl", "last_processed_id": 0},
             )
 
         print("✅ 초기 데이터가 성공적으로 등록되거나 유지되었습니다!")

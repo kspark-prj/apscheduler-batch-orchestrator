@@ -16,5 +16,6 @@ SELECT
     floor(random() * 101)::int AS score,
     NOW() - (random() * 30 * INTERVAL '1 day') AS created_at,
     NOW() AS updated_at
-FROM generate_series(1, 50_000_000) AS s(id)
-ON CONFLICT (user_id) DO NOTHING;
+FROM generate_series(1, 50_000_000) AS s(id);
+
+analyze bulk_test_users;

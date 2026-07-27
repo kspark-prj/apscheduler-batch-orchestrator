@@ -9,14 +9,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 class Base(DeclarativeBase):
     """SQLAlchemy 2.0 스타일 선언적 매핑을 위한 베이스 클래스"""
 
-    pass
-
 
 class BulkTestUser(Base):
     __tablename__ = "bulk_test_users"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(50), nullable=False, unique=True)
+    user_id = Column(String(50), nullable=False)
     username = Column(String(100), nullable=False)
     email = Column(String(150), nullable=True)
     score = Column(Integer, default=0)

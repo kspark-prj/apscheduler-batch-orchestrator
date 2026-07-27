@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, cast
 
 import orjson
+import polars as pl
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.json as pa_json
 from psycopg2.extensions import connection as Connection
 from sqlalchemy import func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -186,7 +190,161 @@ def save_all_fields_to_jsonl(
                 logger.warning(f"🚨 오류 발생으로 인해 불완전한 유저 데이터 파일 삭제: {full_path}")
 
         if logger:
-            logger.error(f"🚨 유저 데이터 파일 저장 중 오류 발생: {str(e)}")
+            logger.error(f"🚨 유저 데이터 파일 저장 중 오류 발생: {e!s}")
+        raise e
+
+
+@track_task_status
+@retry(**COMMON_RETRY_POLICY)
+def save_polars_all_fields_to_jsonl(
+    output_filename: str = "save_pyarrow_all_fields_to_jsonl.jsonl",
+    chunk_size: int = 50_000,
+    logger: Logger = None,
+) -> str:
+    """
+    bulk_test_users 테이블 데이터를 체크포인트 기반으로 읽어
+    PyArrow -> Polars 기반 C++/Rust 고속 엔지니어링으로 JSONL(NDJSON) 파일로 저장합니다.
+    """
+    start_total = time.time()
+    JOB_NAME = "save_polars_all_fields_to_jsonl"
+
+    DATA_DIR = Path(__file__).resolve().parent.parent / "export_data"
+    DATA_DIR.mkdir(exist_ok=True)
+    full_path = DATA_DIR / output_filename
+
+    count = 0
+
+    try:
+        # 1. 체크포인트 및 현재 최고 ID 조회
+        with get_db_session() as session:
+            checkpoint_result = session.execute(
+                text(
+                    "SELECT last_processed_id FROM public.batch_checkpoints WHERE job_name = :job_name;"
+                ),
+                {"job_name": JOB_NAME},
+            )
+            last_seen_id = checkpoint_result.scalar() or 0
+
+            max_id_result = session.execute(text("SELECT MAX(id) FROM public.bulk_test_users;"))
+            max_id = max_id_result.scalar() or 0
+
+        # 새로 추가된 데이터가 없으면 즉시 종료
+        if last_seen_id >= max_id:
+            if logger:
+                logger.info(
+                    f"[{JOB_NAME}] 새로 추가된 데이터가 없어 배치를 종료합니다. (현재 마일스톤: {last_seen_id})"
+                )
+            return "No New Data"
+
+        if logger:
+            logger.info(
+                f"PyArrow + Polars 기반 대용량 유저 데이터 ID 분할 추출 시작...\n"
+                f"▶️ 시작 체크포인트 ID: {last_seen_id} | ⏹️ 이번 배치 상한선 Max ID: {max_id}"
+            )
+
+        start_fetch_write = time.time()
+
+        # 2. PyArrow Explicit Schema 정의 (타입 안전성 보장)
+        arrow_schema = pa.schema(
+            [
+                ("id", pa.int64()),
+                ("user_id", pa.string()),
+                ("username", pa.string()),
+                ("email", pa.string()),
+                ("score", pa.float64()),
+                ("created_at", pa.timestamp("us")),
+                ("updated_at", pa.timestamp("us")),
+            ]
+        )
+
+        # 3. DB 추출 및 PyArrow -> Polars write_ndjson 파일 쓰기
+        with open(full_path, "wb") as f:
+            while True:
+                if last_seen_id >= max_id:
+                    break
+
+                with get_db_session() as session:
+                    query = text("""
+                        SELECT id, user_id, username, email, score, created_at, updated_at
+                        FROM public.bulk_test_users
+                        WHERE id > :last_seen_id
+                        AND id <= :max_id
+                        ORDER BY id ASC
+                        LIMIT :chunk_size
+                    """)
+
+                    result = session.execute(
+                        query,
+                        {
+                            "last_seen_id": last_seen_id,
+                            "max_id": max_id,
+                            "chunk_size": chunk_size,
+                        },
+                    )
+                    rows = result.fetchall()
+
+                    if not rows:
+                        break
+
+                    # PyArrow RecordBatch 생성
+                    columns = list(zip(*rows))
+                    record_batch = pa.RecordBatch.from_arrays(
+                        [pa.array(col) for col in columns],
+                        schema=arrow_schema,
+                    )
+
+                    # 💡 [핵심] PyArrow Table -> Polars DataFrame 변환 (Zero-Copy)
+                    pa_table = pa.Table.from_batches([record_batch])
+                    df = pl.from_arrow(pa_table)
+
+                    # 💡 Polars의 C++/Rust 엔진 기반으로 JSONL(NDJSON) 고속 Append 쓰기
+                    df.write_ndjson(f)  # type:ignore
+
+                    # 청크 마일스톤 및 카운트 update
+                    last_seen_id = rows[-1]._mapping["id"]
+                    count += len(rows)
+
+                    if logger and count % (chunk_size * 5) == 0:
+                        logger.info(
+                            f"진행 중... Polars 처리 {count:,}건 파일 기록 완료 (현재 ID: {last_seen_id})"
+                        )
+
+        time_fetch_write = time.time() - start_fetch_write
+
+        # 4. 파일 작성이 '최종 성공' 했을 때만 체크포인트 커밋 (Fault-Tolerance)
+        with get_db_session() as session:
+            session.execute(
+                text("""
+                    UPDATE public.batch_checkpoints
+                    SET last_processed_id = :max_id, updated_at = NOW()
+                    WHERE job_name = :job_name;
+                """),
+                {"max_id": max_id, "job_name": JOB_NAME},
+            )
+            session.commit()
+
+        time_total = time.time() - start_total
+
+        summary_log = (
+            f"🎉 성공: PyArrow + Polars 기반 전체 유저 필드 저장 및 체크포인트 갱신 완료 ({max_id})\n"
+            f"총 {count:,}건 처리 [DB추출 및 Polars NDJSON 쓰기: {time_fetch_write:.2f}초]\n"
+            f"총 소요시간: {time_total:.2f}초"
+        )
+
+        if logger:
+            logger.info(summary_log)
+
+        return "Done"
+
+    except Exception as e:
+        # 정합성 보호: 실패 시 생성되다 만 불완전한 파일 삭제
+        if "full_path" in locals() and full_path.exists():
+            full_path.unlink()
+            if logger:
+                logger.warning(f"🚨 오류 발생으로 인해 불완전한 유저 데이터 파일 삭제: {full_path}")
+
+        if logger:
+            logger.error(f"🚨 유저 데이터 파일 저장 중 오류 발생: {e!s}")
         raise e
 
 
@@ -253,7 +411,7 @@ def export_and_upload(logger: Logger = None, chunk_size: int = 50_000) -> str:
             # SFTP 경로 사전 체크
             try:
                 sftp.chdir(remote_dir)
-            except IOError:
+            except OSError:
                 if logger:
                     logger.error(
                         f"SFTP 경로 접근 실패: {remote_dir}. 디렉토리 존재 여부를 확인하세요."
@@ -324,7 +482,7 @@ def export_and_upload(logger: Logger = None, chunk_size: int = 50_000) -> str:
             # 4. 정합성 검증 구간
             start_validation = time.time()
             if sftp.stat(remote_path).st_size != local_path.stat().st_size:
-                raise IOError("정합성 오류: 로컬 파일과 원격 파일의 크기가 일치하지 않음.")
+                raise OSError("정합성 오류: 로컬 파일과 원격 파일의 크기가 일치하지 않음.")
             time_validation = time.time() - start_validation
 
             # 5. 💡 [체크포인트 최종 커밋] 추출, 전송, 정합성 검증까지 교차 확인이 끝난 후 마일스톤을 밀어줍니다.
@@ -358,7 +516,7 @@ def export_and_upload(logger: Logger = None, chunk_size: int = 50_000) -> str:
 
     except Exception as e:
         if logger:
-            logger.error(f"🚨 파이프라인 작업 실패: {str(e)}")
+            logger.error(f"🚨 파이프라인 작업 실패: {e!s}")
 
         # 실패 시 원격 서버에 생성되다 만 찌꺼기 파일 제거
         try:
@@ -412,7 +570,7 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
 
             try:
                 remote_stat = sftp.stat(remote_path)
-            except IOError:
+            except OSError:
                 if logger:
                     logger.error(f"SFTP 파일 접근 실패: {remote_path}")
                 raise
@@ -430,7 +588,7 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
 
             # 파일 정합성 검증
             if local_path.stat().st_size != remote_stat.st_size:
-                raise IOError("정합성 오류: 다운로드된 파일의 크기가 원격지와 일치하지 않습니다.")
+                raise OSError("정합성 오류: 다운로드된 파일의 크기가 원격지와 일치하지 않습니다.")
 
             # 2. DB 임시 테이블 세팅
             session.execute(text("SET LOCAL temp_buffers = '256MB';"))
@@ -453,7 +611,7 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
                     self.buffer = ""
 
                 def read(self, size: int = -1) -> str:
-                    if len(self.buffer) >= size and size > 0:
+                    if len(self.buffer) >= size > 0:
                         chunk = self.buffer[:size]
                         self.buffer = self.buffer[size:]
                         return chunk
@@ -562,7 +720,7 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
 
     except Exception as e:
         if logger:
-            logger.error(f"🚨 파이프라인 작업 실패: {str(e)}")
+            logger.error(f"🚨 파이프라인 작업 실패: {e!s}")
         if "session" in locals() and session:
             session.rollback()
 
