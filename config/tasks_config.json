@@ -20,7 +20,7 @@
   },
   {
     "name": "save_postgres_native_to_csv",
-    "cron": "27 * * * *",
+    "cron": "22 * * * *",
     "args": []
   }
 ]
