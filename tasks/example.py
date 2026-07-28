@@ -434,7 +434,7 @@ def save_postgres_native_to_csv(
                         ) TO STDOUT WITH (FORMAT csv, {header_option}, DELIMITER ',');
                     """
 
-                    with raw_conn.cursor() as cur:
+                    with raw_conn.cursor() as cur:  # type:ignore
                         cur.copy_expert(copy_sql, f)
 
                         # 처리된 행 개수 카운트
@@ -750,15 +750,17 @@ def download_and_import(logger: Logger = None, chunk_size: int = 100_000) -> str
         # ==========================================================
         # 2. JSONL 매핑 및 타입 지정을 위한 Explicit Schema 정의
         # ==========================================================
-        jsonl_schema = pl.Schema({
-            "id": pl.Int64,
-            "user_id": pl.Utf8,
-            "username": pl.Utf8,
-            "email": pl.Utf8,
-            "score": pl.Float64,  # JSONL 상에서 25.0 과 같은 소수점으로 읽힐 수 있으므로 Float64 선언
-            "created_at": pl.Utf8,
-            "updated_at": pl.Utf8,
-        })
+        jsonl_schema = pl.Schema(
+            {
+                "id": pl.Int64,
+                "user_id": pl.Utf8,
+                "username": pl.Utf8,
+                "email": pl.Utf8,
+                "score": pl.Float64,  # JSONL 상에서 25.0 과 같은 소수점으로 읽힐 수 있으므로 Float64 선언
+                "created_at": pl.Utf8,
+                "updated_at": pl.Utf8,
+            }
+        )
 
         # ==========================================================
         # 3. DB 임시 테이블 세팅 및 Chunk 단위 COPY
@@ -796,14 +798,16 @@ def download_and_import(logger: Logger = None, chunk_size: int = 100_000) -> str
                         continue
 
                     # 💡 [핵심] DB Integer 컬럼에 "25.0" 문자열이 들어가 발생하는 오류를 방지하기 위해 Int64로 캐스팅
-                    mapped_df = chunk_df.select([
-                        "user_id",
-                        "username",
-                        "email",
-                        pl.col("score").fill_null(0).round(0).cast(pl.Int64).alias("score"),
-                        "created_at",
-                        "updated_at"
-                    ])
+                    mapped_df = chunk_df.select(
+                        [
+                            "user_id",
+                            "username",
+                            "email",
+                            pl.col("score").fill_null(0).round(0).cast(pl.Int64).alias("score"),
+                            "created_at",
+                            "updated_at",
+                        ]
+                    )
 
                     tsv_bytes = mapped_df.write_csv(
                         file=None,
@@ -812,7 +816,9 @@ def download_and_import(logger: Logger = None, chunk_size: int = 100_000) -> str
                         null_value="\\N",
                     )
 
-                    buf = io.BytesIO(tsv_bytes.encode("utf-8") if isinstance(tsv_bytes, str) else tsv_bytes)
+                    buf = io.BytesIO(
+                        tsv_bytes.encode("utf-8") if isinstance(tsv_bytes, str) else tsv_bytes
+                    )
                     cursor.copy_expert(sql=copy_query, file=buf)
 
                     total_count += chunk_len
