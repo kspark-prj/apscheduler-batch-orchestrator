@@ -348,6 +348,149 @@ def save_polars_all_fields_to_jsonl(
         raise e
 
 
+from logging import Logger
+
+from tenacity import retry
+
+
+@track_task_status
+@retry(**COMMON_RETRY_POLICY)
+def save_postgres_native_to_csv(
+    output_filename: str = "bulk_user_data.csv",
+    chunk_size: int = 50_000,
+    include_header: bool = False,
+    logger: Logger = None,
+) -> str:
+    """
+    bulk_test_users 테이블 데이터를 PostgreSQL Native COPY (CSV 포맷)를 활용하여
+    DB 연산 병목 없이 극강의 속도로 CSV 파일에 저장합니다.
+
+    - json_build_object() 연산을 제거하여 DB CPU 부하를 없앴습니다.
+    - 첫 번째 청크 작성 시에만 CSV 헤더(Header)를 선택적으로 출력합니다.
+    - ID Range 기반 Chunking으로 파일 버퍼(f.flush)를 비워 OOM을 방지하고 진행 로그를 출력합니다.
+    """
+    start_total = time.time()
+    JOB_NAME = "save_postgres_native_to_csv"
+
+    DATA_DIR = Path(__file__).resolve().parent.parent / "export_data"
+    DATA_DIR.mkdir(exist_ok=True)
+    full_path = DATA_DIR / output_filename
+
+    count = 0
+
+    try:
+        # 1. 체크포인트 및 Max ID 조회
+        with get_db_session() as session:
+            last_seen_id = (
+                session.execute(
+                    text(
+                        "SELECT last_processed_id FROM public.batch_checkpoints WHERE job_name = :job_name;"
+                    ),
+                    {"job_name": JOB_NAME},
+                ).scalar()
+                or 0
+            )
+
+            max_id = (
+                session.execute(text("SELECT MAX(id) FROM public.bulk_test_users;")).scalar() or 0
+            )
+
+        if last_seen_id >= max_id:
+            if logger:
+                logger.info(
+                    f"[{JOB_NAME}] 새로 추가된 데이터가 없어 배치를 종료합니다. (현재 마일스톤: {last_seen_id})"
+                )
+            return "No New Data"
+
+        if logger:
+            logger.info(
+                f"PostgreSQL Native CSV COPY 추출 시작...\n"
+                f"▶️ 시작 체크포인트 ID: {last_seen_id} | ⏹️ 이번 배치 상한선 Max ID: {max_id}"
+            )
+
+        start_fetch_write = time.time()
+        is_first_chunk = True
+
+        # 2. Append Binary 모드로 open
+        with open(full_path, "ab") as f:
+            while last_seen_id < max_id:
+                current_chunk_max = min(last_seen_id + chunk_size, max_id)
+
+                with get_db_session() as session:
+                    raw_conn = session.connection().connection.driver_connection
+
+                    # 💡 [핵심] json_build_object() 대신 Native CSV 포맷으로 직접 스트리밍
+                    # 첫 번째 청크일 때만 HEADER 옵션을 켤 수 있도록 제어
+                    header_option = (
+                        "HEADER true" if (include_header and is_first_chunk) else "HEADER false"
+                    )
+
+                    copy_sql = f"""
+                        COPY (
+                            SELECT id, user_id, username, email, score, created_at, updated_at
+                            FROM public.bulk_test_users
+                            WHERE id > {last_seen_id} AND id <= {current_chunk_max}
+                            ORDER BY id ASC
+                        ) TO STDOUT WITH (FORMAT csv, {header_option}, DELIMITER ',');
+                    """
+
+                    with raw_conn.cursor() as cur:
+                        cur.copy_expert(copy_sql, f)
+
+                        # 처리된 행 개수 카운트
+                        rows_written = (
+                            cur.rowcount
+                            if cur.rowcount != -1
+                            else (current_chunk_max - last_seen_id)
+                        )
+                        count += rows_written
+
+                # 파일 버퍼 강제 비우기 (OOM 방지 및 디스크 동기화)
+                f.flush()
+
+                last_seen_id = current_chunk_max
+                is_first_chunk = False
+
+                if logger and count % (chunk_size * 5) == 0:
+                    logger.info(
+                        f"진행 중... Native CSV COPY 누적 완료: {count:,}건 (현재 ID 마일스톤: {last_seen_id})"
+                    )
+
+        time_fetch_write = time.time() - start_fetch_write
+
+        # 3. 체크포인트 갱신 (Fault-Tolerance)
+        with get_db_session() as session:
+            session.execute(
+                text("""
+                    UPDATE public.batch_checkpoints
+                    SET last_processed_id = :max_id, updated_at = NOW()
+                    WHERE job_name = :job_name;
+                """),
+                {"max_id": max_id, "job_name": JOB_NAME},
+            )
+            session.commit()
+
+        time_total = time.time() - start_total
+
+        if logger:
+            logger.info(
+                f"🎉 성공: PostgreSQL Native CSV COPY 완료 ({count:,}건 처리)\n"
+                f"[DB COPY 및 파일작성: {time_fetch_write:.2f}초 | 총 소요시간: {time_total:.2f}초]"
+            )
+
+        return "Done"
+
+    except Exception as e:
+        if "full_path" in locals() and full_path.exists():
+            full_path.unlink()
+            if logger:
+                logger.warning(f"🚨 오류 발생으로 인해 불완전한 CSV 파일 삭제: {full_path}")
+
+        if logger:
+            logger.error(f"🚨 CSV COPY 처리 중 오류 발생: {e!s}")
+        raise e
+
+
 @track_task_status
 @retry(**COMMON_RETRY_POLICY)
 def export_and_upload(logger: Logger = None, chunk_size: int = 50_000) -> str:

@@ -19,8 +19,8 @@
     ]
   },
   {
-    "name": "save_polars_all_fields_to_jsonl",
-    "cron": "48 * * * *",
+    "name": "save_postgres_native_to_csv",
+    "cron": "27 * * * *",
     "args": []
   }
 ]
