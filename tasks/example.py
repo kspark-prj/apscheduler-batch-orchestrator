@@ -494,202 +494,223 @@ def save_postgres_native_to_csv(
 @track_task_status
 @retry(**COMMON_RETRY_POLICY)
 def export_and_upload(logger: Logger = None, chunk_size: int = 50_000) -> str:
+    """[PyArrow + Polars C++/Rust 고속 파싱 & SFTP 최적화 파이프라인]
+    1. DB CPU 부하를 일으키는 json_build_object()를 제거하고 튜플 데이터만 빠르게 추출
+    2. PyArrow -> Polars(Zero-Copy) 변환 후 C++/Rust 엔진 기반 NDJSON(JSONL) 초고속 파일 쓰기
+    3. DB 세션과 SFTP 세션 스코프 분리로 커넥션 점유 최소화
+    4. SFTP 업로드 및 정합성 검증 성공 시에만 체크포인트 갱신 (Fault-Tolerance)
     """
-    ID 기반 조각내기(Chunking) 및 체크포인트 방식으로 DB 부하를 최소화하며 데이터를 추출하고,
-    로컬 JSONL 저장 후 SFTP로 안전하게 전송하는 최적화 파이프라인 함수입니다.
-
-    - 배치 시작 시점의 MAX(id)까지만 조회하여 실시간 인서트에 의한 라이브 락(무한 루프)을 방지합니다.
-    - SFTP 업로드 및 사이즈 정합성 검증까지 완전히 '성공'했을 때만 체크포인트를 업데이트합니다.
-    - 예외 발생 시 원격지와 로컬의 불완전한 파일들을 깔끔하게 정리합니다.
-    """
-    start_total = time.time()  # 전체 프로세스 시작 시간
+    start_total = time.perf_counter()
     JOB_NAME = "export_and_upload"
 
-    # 프로젝트 구조에 맞게 로컬 데이터 저장 경로 설정
     DATA_DIR = Path(__file__).resolve().parent.parent / "export_data"
     DATA_DIR.mkdir(exist_ok=True)
 
-    unique_filename = "bulk_user_data.jsonl"
-    local_path = DATA_DIR / unique_filename
-    remote_dir = "/uploads"
-    remote_path = f"{remote_dir}/{unique_filename}"
+    # 동시성 및 안전성을 위한 고유 임시 파일명 설정
+    temp_filename = "export_upload_bulk_user_data.jsonl"
+    remote_filename = "bulk_user_data.jsonl"
 
-    # 구간별 시간 측정을 위한 변수 초기화
-    time_init = 0.0
+    local_path = DATA_DIR / temp_filename
+    remote_dir = "/uploads"
+    remote_path = f"{remote_dir}/{remote_filename}"
+
+    count = 0
     time_fetch_write = 0.0
     time_sftp_upload = 0.0
     time_validation = 0.0
 
-    count = 0
-
     try:
-        with ExitStack() as stack:
-            # 1. 초기 세션 연결 및 준비 구간 (체크포인트 및 Max ID 획득, SFTP 연결)
-            start_init = time.time()
+        # ==========================================================
+        # 1. 체크포인트 및 상한선 ID 조회
+        # ==========================================================
+        with get_db_session() as session:
+            checkpoint_result = session.execute(
+                text(
+                    "SELECT last_processed_id FROM public.batch_checkpoints WHERE job_name = :job_name;"
+                ),
+                {"job_name": JOB_NAME},
+            )
+            last_seen_id = checkpoint_result.scalar() or 0
 
-            # 💡 [마일스톤 조회] 지난 배치 성공 시점의 ID와 현재 최고 ID를 먼저 판별합니다.
-            with get_db_session() as session:
-                checkpoint_result = session.execute(
-                    text(
-                        "SELECT last_processed_id FROM public.batch_checkpoints WHERE job_name = :job_name;"
-                    ),
-                    {"job_name": JOB_NAME},
+            max_id_result = session.execute(text("SELECT MAX(id) FROM public.bulk_test_users;"))
+            max_id = max_id_result.scalar() or 0
+
+        if last_seen_id >= max_id:
+            if logger:
+                logger.info(
+                    f"[{JOB_NAME}] 새로 추가된 데이터가 없어 배치를 종료합니다. (현재 마일스톤: {last_seen_id})"
                 )
-                last_seen_id = checkpoint_result.scalar() or 0
+            return "No New Data"
 
-                max_id_result = session.execute(text("SELECT MAX(id) FROM public.bulk_test_users;"))
-                max_id = max_id_result.scalar() or 0
+        if logger:
+            logger.info(
+                f"PyArrow + Polars 기반 대용량 유저 데이터 ID 분할 추출 및 SFTP 파이프라인 시작...\n"
+                f"▶️ 시작 체크포인트 ID: {last_seen_id} | ⏹️ 이번 배치 상한선 Max ID: {max_id}"
+            )
 
-            # 처리할 새 데이터가 없다면 커넥션을 맺지 않고 바로 종료 (자원 절약)
-            if last_seen_id >= max_id:
-                if logger:
-                    logger.info(
-                        f"[{JOB_NAME}] 새로 추가된 데이터가 없어 배치를 종료합니다. (현재 마일스톤: {last_seen_id})"
+        # ==========================================================
+        # 2. Explicit PyArrow Schema 정의 (타입 안전성 및 속도 확보)
+        # ==========================================================
+        arrow_schema = pa.schema(
+            [
+                ("id", pa.int64()),
+                ("user_id", pa.string()),
+                ("username", pa.string()),
+                ("email", pa.string()),
+                ("score", pa.float64()),
+                ("created_at", pa.timestamp("us")),
+                ("updated_at", pa.timestamp("us")),
+            ]
+        )
+
+        # ==========================================================
+        # 3. DB 추출 및 Polars write_ndjson 고속 Append 쓰기
+        # ==========================================================
+        start_fetch_write = time.perf_counter()
+
+        with open(local_path, "wb") as f:
+            while last_seen_id < max_id:
+                with get_db_session() as session:
+                    query = text("""
+                        SELECT id, user_id, username, email, score, created_at, updated_at
+                        FROM public.bulk_test_users
+                        WHERE id > :last_seen_id
+                        AND id <= :max_id
+                        ORDER BY id ASC
+                        LIMIT :chunk_size
+                    """)
+
+                    result = session.execute(
+                        query,
+                        {
+                            "last_seen_id": last_seen_id,
+                            "max_id": max_id,
+                            "chunk_size": chunk_size,
+                        },
                     )
-                return "No New Data"
+                    rows = result.fetchall()
 
-            sftp = stack.enter_context(get_sftp_client())
-            assert sftp is not None, "SFTP 클라이언트 객체가 생성되지 않았습니다 (None)."
+                    if not rows:
+                        break
 
-            # SFTP 경로 사전 체크
+                    # 💡 DB 튜플 -> PyArrow RecordBatch 생성
+                    columns = list(zip(*rows))
+                    record_batch = pa.RecordBatch.from_arrays(
+                        [pa.array(col) for col in columns],
+                        schema=arrow_schema,
+                    )
+
+                    # 💡 PyArrow Table -> Polars DataFrame (Zero-Copy)
+                    pa_table = pa.Table.from_batches([record_batch])
+                    df = pl.from_arrow(pa_table)
+
+                    # 💡 Polars의 C++/Rust 엔진 기반으로 JSONL(NDJSON) 고속 Append 쓰기
+                    df.write_ndjson(f)  # type: ignore
+
+                    last_seen_id = rows[-1]._mapping["id"]
+                    count += len(rows)
+
+                    if logger and count % (chunk_size * 5) == 0:
+                        logger.info(
+                            f"진행 중... Polars 처리 {count:,}건 파일 기록 완료 (현재 ID: {last_seen_id})"
+                        )
+
+        time_fetch_write = time.perf_counter() - start_fetch_write
+
+        # ==========================================================
+        # 4. SFTP 업로드 및 정합성 검증 (DB 세션 완전 분리)
+        # ==========================================================
+        if logger:
+            logger.info(f"SFTP 전송 시작 -> {remote_path} ({count:,}건 데이터)")
+
+        with get_sftp_client() as sftp:
+            assert sftp is not None, "SFTP 클라이언트 객체가 유효하지 않습니다."
+
             try:
                 sftp.chdir(remote_dir)
             except OSError:
                 if logger:
-                    logger.error(
-                        f"SFTP 경로 접근 실패: {remote_dir}. 디렉토리 존재 여부를 확인하세요."
-                    )
+                    logger.error(f"SFTP 경로 접근 실패: {remote_dir}")
                 raise
-            time_init = time.time() - start_init
 
-            # 2. 데이터베이스 쿼리 및 파일 쓰기 구간 (ID 기반 Chunking + 상한선 제한)
-            if logger:
-                logger.info(
-                    f"대용량 유저 데이터베이스 분할 조회 시작...\n"
-                    f"▶️ 시작 체크포인트 ID: {last_seen_id} | ⏹️ 이번 배치 상한선 Max ID: {max_id}"
-                )
-            start_fetch_write = time.time()
-
-            with open(local_path, "wb") as f:
-                while True:
-                    # 💡 [차단벽] 데이터가 진행되는 동안 상한선인 max_id를 넘겼다면 루프 즉시 탈출
-                    if last_seen_id >= max_id:
-                        break
-
-                    with get_db_session() as session:
-                        # 💡 id <= :max_id 조건을 추가하여 실시간 유입 데이터를 격리합니다.
-                        query = text("""
-                            SELECT id, user_id, username, email, score, created_at, updated_at
-                            FROM public.bulk_test_users
-                            WHERE id > :last_seen_id
-                            AND id <= :max_id
-                            ORDER BY id ASC
-                            LIMIT :chunk_size
-                        """)
-
-                        result = session.execute(
-                            query,
-                            {
-                                "last_seen_id": last_seen_id,
-                                "max_id": max_id,
-                                "chunk_size": chunk_size,
-                            },
-                        )
-                        rows = result.fetchall()
-
-                        if not rows:
-                            break  # 범위 내 데이터 소진 시 탈출
-
-                        for row in rows:
-                            data = dict(row._mapping)
-                            f.write(orjson.dumps(data) + b"\n")
-
-                        # 마지막 ID 갱신 및 카운트 증가
-                        last_seen_id = rows[-1]._mapping["id"]
-                        count += len(rows)
-
-                        if logger and count % (chunk_size * 5) == 0:
-                            logger.info(
-                                f"진행 중: 유저 데이터 {count:,}건 파일 작성 완료 (현재 ID: {last_seen_id})"
-                            )
-
-            time_fetch_write = time.time() - start_fetch_write
-
-            # 3. SFTP 전송 구간
-            if logger:
-                logger.info(f"SFTP 전송 시작: {unique_filename} ({count:,}건 데이터)")
-            start_sftp_upload = time.time()
+            # SFTP 파일 전송
+            start_upload = time.perf_counter()
             sftp.put(str(local_path), remote_path)
-            time_sftp_upload = time.time() - start_sftp_upload
+            time_sftp_upload = time.perf_counter() - start_upload
 
-            # 4. 정합성 검증 구간
-            start_validation = time.time()
+            # 정합성 검증 (파일 크기 비교)
+            start_val = time.perf_counter()
             if sftp.stat(remote_path).st_size != local_path.stat().st_size:
-                raise OSError("정합성 오류: 로컬 파일과 원격 파일의 크기가 일치하지 않음.")
-            time_validation = time.time() - start_validation
+                raise OSError("정합성 오류: 로컬 파일과 원격 파일의 크기가 일치하지 않습니다.")
+            time_validation = time.perf_counter() - start_val
 
-            # 5. 💡 [체크포인트 최종 커밋] 추출, 전송, 정합성 검증까지 교차 확인이 끝난 후 마일스톤을 밀어줍니다.
-            with get_db_session() as session:
-                session.execute(
-                    text("""
-                        UPDATE public.batch_checkpoints
-                        SET last_processed_id = :max_id, updated_at = NOW()
-                        WHERE job_name = :job_name;
-                    """),
-                    {"max_id": max_id, "job_name": JOB_NAME},
-                )
-                session.commit()
-
-            # 6. 전체 소요 시간 계산 및 로그 출력
-            time_total = time.time() - start_total
-
-            summary_log = (
-                f"🎉 Done: 유저 데이터 {count:,}건 추출 및 SFTP 업로드 완료 (체크포인트 {max_id}번 마킹) | "
-                f"총 소요시간: {time_total:.2f}초 "
-                f"[1.연결및준비: {time_init:.2f}초 | "
-                f"2.DB추출및파일작성: {time_fetch_write:.2f}초 | "
-                f"3.SFTP전송: {time_sftp_upload:.2f}초 | "
-                f"4.정합성검증: {time_validation:.2f}초]"
+        # ==========================================================
+        # 5. 체크포인트 최종 커밋
+        # ==========================================================
+        with get_db_session() as session:
+            session.execute(
+                text("""
+                    UPDATE public.batch_checkpoints
+                    SET last_processed_id = :max_id, updated_at = NOW()
+                    WHERE job_name = :job_name;
+                """),
+                {"max_id": max_id, "job_name": JOB_NAME},
             )
+            session.commit()
 
-            if logger:
-                logger.info(summary_log)
+        time_total = time.perf_counter() - start_total
 
-            return summary_log
+        summary_log = (
+            f"🎉 Done: 유저 데이터 {count:,}건 Polars 추출 및 SFTP 업로드 완료 (체크포인트 {max_id}번 마킹) | "
+            f"총 소요시간: {time_total:.2f}초 "
+            f"[DB추출및Polars작성: {time_fetch_write:.2f}초 | "
+            f"SFTP전송: {time_sftp_upload:.2f}초 | "
+            f"정합성검증: {time_validation:.2f}초]"
+        )
+
+        if logger:
+            logger.info(summary_log)
+
+        return summary_log
 
     except Exception as e:
         if logger:
             logger.error(f"🚨 파이프라인 작업 실패: {e!s}")
 
-        # 실패 시 원격 서버에 생성되다 만 찌꺼기 파일 제거
+        # 실패 시 원격지의 불완전 파일 안전하게 제거
         try:
-            if "sftp" in locals() and sftp:
-                sftp.remove(remote_path)
-                if logger:
-                    logger.warning(f"오류 발생으로 원격지 불완전 파일 제거 완료: {remote_path}")
-        except Exception:
-            pass
+            with get_sftp_client() as sftp:
+                if sftp:
+                    sftp.remove(remote_path)
+                    if logger:
+                        logger.warning(f"오류 발생으로 원격지 불완전 파일 제거 완료: {remote_path}")
+        except Exception as cleanup_err:
+            if logger:
+                logger.debug(f"원격지 cleanup 중 경고 (무시됨): {cleanup_err!s}")
+
         raise e
 
     finally:
-        # 7. 로컬 임시 파일 완전 삭제 (성공/실패 공통)
+        # 로컬 임시 파일 삭제 (성공/실패 공통)
         if local_path.exists():
-            local_path.unlink()
-            if logger:
-                logger.debug(f"로컬 임시 백업 파일 정리 완료: {unique_filename}")
+            try:
+                local_path.unlink()
+                if logger:
+                    logger.debug(f"로컬 임시 파일 정리 완료: {temp_filename}")
+            except Exception:
+                pass
 
 
 @track_task_status
 @retry(**COMMON_RETRY_POLICY)
-def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
-    """[로컬 로그 보관 + 메모리 OOM 방지 완료 버전]
-    1. SFTP에서 로컬 data/ 폴더로 원본 파일을 안전하게 다운로드하여 보관합니다.
-    2. CopyStreamWrapper가 로컬 파일을 읽을 때 size 버퍼를 준수하여 메모리 OOM을 방지합니다.
-    3. LIKE 구문 및 차분 UPSERT로 PG 카탈로그와 MVCC 부하를 최소화합니다.
+def download_and_import(logger: Logger = None, chunk_size: int = 100_000) -> str:
+    """[Polars Explicit Schema JSONL Parsing + Type Safe COPY 최적화 파이프라인]
+    1. SFTP에서 로컬로 파일 다운로드 (DB 커넥션 점유 최소화)
+    2. Polars 기반 타입 형변환(Float->Int) 처리 및 Chunk 단위 TSV 바이트 변환 (COPY Syntax 에러 방지)
+    3. TEMP TABLE 인덱싱 및 차분 UPSERT로 PG CPU/MVCC 부하 최소화
     """
     func_start = time.perf_counter()
 
-    # 💡 로그 보관을 위한 로컬 디스크 경로 설정
     DATA_DIR = Path(__file__).resolve().parent.parent / "export_data"
     DATA_DIR.mkdir(exist_ok=True)
 
@@ -697,20 +718,18 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
     remote_filename = "bulk_user_data.jsonl"
     remote_path = f"{remote_dir}/{remote_filename}"
 
-    # 이력 관리를 위해 고유한 파일명으로 로컬에 저장 (예: download_20260707_abcd.jsonl)
-    # 날짜나 UUID를 조합하여 기존 파일이 덮어써지는 것을 방지합니다.
     unique_filename = f"backup_{uuid.uuid4().hex}_{remote_filename}"
     local_path = DATA_DIR / unique_filename
 
     total_count = 0
-    target_keys = ["user_id", "username", "email", "score", "created_at", "updated_at"]
 
     try:
-        with ExitStack() as stack:
-            session = stack.enter_context(get_db_session())
-            sftp = stack.enter_context(get_sftp_client())
+        # ==========================================================
+        # 1. SFTP 파일 다운로드
+        # ==========================================================
+        sftp_start = time.perf_counter()
+        with get_sftp_client() as sftp:
             assert sftp is not None, "SFTP 클라이언트 객체가 유효하지 않습니다."
-
             try:
                 remote_stat = sftp.stat(remote_path)
             except OSError:
@@ -718,23 +737,39 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
                     logger.error(f"SFTP 파일 접근 실패: {remote_path}")
                 raise
 
-            # 1. SFTP 다운로드 구간 (로컬에 로그 보관용 파일 생성)
             if logger:
                 logger.info(f"SFTP 파일 다운로드 시작 -> 로컬 보관 경로: {local_path}")
-            sftp_start = time.perf_counter()
             sftp.get(remote_path, str(local_path))
 
-            if logger:
-                logger.info(
-                    f"⏱️ [구간 통계] 다운로드 완료: {time.perf_counter() - sftp_start:.4f}초"
-                )
+        if logger:
+            logger.info(f"⏱️ [구간 통계] 다운로드 완료: {time.perf_counter() - sftp_start:.4f}초")
 
-            # 파일 정합성 검증
-            if local_path.stat().st_size != remote_stat.st_size:
-                raise OSError("정합성 오류: 다운로드된 파일의 크기가 원격지와 일치하지 않습니다.")
+        if local_path.stat().st_size != remote_stat.st_size:
+            raise OSError("정합성 오류: 다운로드된 파일의 크기가 원격지와 일치하지 않습니다.")
 
-            # 2. DB 임시 테이블 세팅
+        # ==========================================================
+        # 2. JSONL 매핑 및 타입 지정을 위한 Explicit Schema 정의
+        # ==========================================================
+        jsonl_schema = pl.Schema({
+            "id": pl.Int64,
+            "user_id": pl.Utf8,
+            "username": pl.Utf8,
+            "email": pl.Utf8,
+            "score": pl.Float64,  # JSONL 상에서 25.0 과 같은 소수점으로 읽힐 수 있으므로 Float64 선언
+            "created_at": pl.Utf8,
+            "updated_at": pl.Utf8,
+        })
+
+        # ==========================================================
+        # 3. DB 임시 테이블 세팅 및 Chunk 단위 COPY
+        # ==========================================================
+        db_start = time.perf_counter()
+
+        with get_db_session() as session:
             session.execute(text("SET LOCAL temp_buffers = '256MB';"))
+            session.execute(text("SET LOCAL work_mem = '256MB';"))
+            session.execute(text("SET LOCAL synchronous_commit = off;"))
+
             session.execute(
                 text("""
                 CREATE TEMP TABLE temp_bulk_test_users (
@@ -746,90 +781,56 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
             raw_conn = cast(Connection, session.connection().connection.driver_connection)
             assert raw_conn is not None
 
-            # 3. 💡 고속 스트림 변환 래퍼 (로컬 파일을 청크 단위로 쪼개 읽어 OOM 방지)
-            class CopyStreamWrapper(io.TextIOBase):
-                def __init__(self, file_path):
-                    self.f = open(file_path, "r", encoding="utf-8")
-                    self.count = 0
-                    self.buffer = ""
-
-                def read(self, size: int = -1) -> str:
-                    if len(self.buffer) >= size > 0:
-                        chunk = self.buffer[:size]
-                        self.buffer = self.buffer[size:]
-                        return chunk
-
-                    lines = []
-                    current_length = 0
-
-                    # 💡 파일 전체를 리스트에 담지 않고, PG 드라이버가 요청한 size만큼만 한 줄씩 읽음
-                    for line in self.f:
-                        if not line.strip():
-                            continue
-                        try:
-                            row_data = orjson.loads(line)
-                            vals = []
-                            for k in target_keys:
-                                v = row_data.get(k)
-                                if v is None:
-                                    vals.append("NULL")
-                                else:
-                                    vals.append(
-                                        str(v)
-                                        .replace("\\", "\\\\")
-                                        .replace("\n", " ")
-                                        .replace("\t", " ")
-                                    )
-
-                            converted_line = "\t".join(vals) + "\n"
-                            lines.append(converted_line)
-                            current_length += len(converted_line)
-                            self.count += 1
-
-                            if size > 0 and current_length >= size:
-                                break
-                        except orjson.JSONDecodeError:
-                            continue
-
-                    if not lines and not self.buffer:
-                        return ""  # EOF
-
-                    total_str = self.buffer + "".join(lines)
-                    if size > 0 and len(total_str) > size:
-                        self.buffer = total_str[size:]
-                        return total_str[:size]
-                    else:
-                        self.buffer = ""
-                        return total_str
-
-                def close(self):
-                    if not self.f.closed:
-                        self.f.close()
-
-            # 4. COPY 실행
             copy_query = """
                 COPY temp_bulk_test_users (
                     user_id, username, email, score, created_at, updated_at
-                ) FROM STDIN WITH (FORMAT text, NULL 'NULL');
+                ) FROM STDIN WITH (FORMAT csv, DELIMITER E'\t', NULL '\\N');
             """
 
-            copy_start = time.perf_counter()
+            lazy_df = pl.scan_ndjson(str(local_path), schema=jsonl_schema)
+
             with raw_conn.cursor() as cursor:
-                stream_wrapper = CopyStreamWrapper(local_path)
-                try:
-                    cursor.copy_expert(sql=copy_query, file=stream_wrapper)
-                finally:
-                    stream_wrapper.close()
-                total_count = stream_wrapper.count
+                for chunk_df in lazy_df.collect_batches(chunk_size=chunk_size):
+                    chunk_len = len(chunk_df)
+                    if chunk_len == 0:
+                        continue
+
+                    # 💡 [핵심] DB Integer 컬럼에 "25.0" 문자열이 들어가 발생하는 오류를 방지하기 위해 Int64로 캐스팅
+                    mapped_df = chunk_df.select([
+                        "user_id",
+                        "username",
+                        "email",
+                        pl.col("score").fill_null(0).round(0).cast(pl.Int64).alias("score"),
+                        "created_at",
+                        "updated_at"
+                    ])
+
+                    tsv_bytes = mapped_df.write_csv(
+                        file=None,
+                        separator="\t",
+                        include_header=False,
+                        null_value="\\N",
+                    )
+
+                    buf = io.BytesIO(tsv_bytes.encode("utf-8") if isinstance(tsv_bytes, str) else tsv_bytes)
+                    cursor.copy_expert(sql=copy_query, file=buf)
+
+                    total_count += chunk_len
+
+                    if logger and total_count % (chunk_size * 5) == 0:
+                        logger.info(f"진행 중... Staging Table 누적 적재: {total_count:,}건")
 
             if logger:
                 logger.info(
-                    f"⏱️ [구간 통계] 로컬 파일 -> DB COPY 완료: {total_count:,}건 ({time.perf_counter() - copy_start:.4f}초)"
+                    f"⏱️ [구간 통계] Polars Streaming 파싱 & Staging COPY 완료: {total_count:,}건 ({time.perf_counter() - db_start:.4f}초)"
                 )
 
-            # 5. 최종 내부 병합 (Bulk UPSERT)
-            session.execute(text("SET LOCAL synchronous_commit = off;"))
-            session.execute(text("SET LOCAL work_mem = '256MB';"))
+            # ==========================================================
+            # 4. 차분 UPSERT
+            # ==========================================================
+            upsert_start = time.perf_counter()
+
+            session.execute(text("ALTER TABLE temp_bulk_test_users ADD PRIMARY KEY (user_id);"))
 
             session.execute(
                 text("""
@@ -837,38 +838,41 @@ def download_and_import(logger: Logger = None, chunk_size: int = 50_000) -> str:
                     user_id, username, email, score, created_at, updated_at
                 )
                 SELECT
-                    user_id, username, email, score, created_at, timezone('Asia/Seoul', now())
+                    user_id, username, email, score,
+                    created_at::timestamp, CURRENT_TIMESTAMP
                 FROM temp_bulk_test_users
                 ON CONFLICT (user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    email = EXCLUDED.email,
-                    score = EXCLUDED.score,
-                    updated_at = timezone('Asia/Seoul', now())
+                    username   = EXCLUDED.username,
+                    email      = EXCLUDED.email,
+                    score      = EXCLUDED.score,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE
                     bulk_test_users.username IS DISTINCT FROM EXCLUDED.username OR
-                    bulk_test_users.email IS DISTINCT FROM EXCLUDED.email OR
-                    bulk_test_users.score IS DISTINCT FROM EXCLUDED.score;
+                    bulk_test_users.email    IS DISTINCT FROM EXCLUDED.email OR
+                    bulk_test_users.score    IS DISTINCT FROM EXCLUDED.score;
                 """)
             )
 
             session.commit()
 
-            total_elapsed = time.perf_counter() - func_start
             if logger:
                 logger.info(
-                    f"🎉 [성공] 총 {total_count:,}건 적재 완료 및 원본 파일 보관 성공 (총 소요시간: {total_elapsed:.4f}초)"
+                    f"⏱️ [구간 통계] 차분 UPSERT 완료: ({time.perf_counter() - upsert_start:.4f}초)"
                 )
 
-            return f"Done: {total_count}건 적재 완료 (파일 보관됨)"
+        total_elapsed = time.perf_counter() - func_start
+        if logger:
+            logger.info(
+                f"🎉 [성공] 총 {total_count:,}건 적재 완료 및 원본 파일 보관 성공 (총 소요시간: {total_elapsed:.4f}초)"
+            )
+
+        return f"Done: {total_count}건 적재 완료 (파일 보관됨)"
 
     except Exception as e:
         if logger:
             logger.error(f"🚨 파이프라인 작업 실패: {e!s}")
-        if "session" in locals() and session:
-            session.rollback()
 
-        # 💡 실패한 경우는 불완전한 데이터이므로 보관하지 않고 지워줍니다.
-        if "local_path" in locals() and local_path.exists():
+        if local_path.exists():
             try:
                 local_path.unlink()
             except Exception:

@@ -14,7 +14,7 @@ class BulkTestUser(Base):
     __tablename__ = "bulk_test_users"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(50), nullable=False)
+    user_id = Column(String(50), nullable=False, unique=True, index=True)
     username = Column(String(100), nullable=False)
     email = Column(String(150), nullable=True)
     score = Column(Integer, default=0)
